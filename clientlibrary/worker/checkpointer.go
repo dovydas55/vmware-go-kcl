@@ -39,7 +39,7 @@ import (
 	"github.com/matryer/try"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/vmware/vmware-go-kcl/clientlibrary/config"
+	"github.com/dovydas55/vmware-go-kcl/clientlibrary/config"
 )
 
 const (

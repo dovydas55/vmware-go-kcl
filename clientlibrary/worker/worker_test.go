@@ -19,23 +19,24 @@
 package worker
 
 import (
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"net/http"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
+	"github.com/aws/aws-sdk-go/aws/session"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/prometheus/common/expfmt"
 	log "github.com/sirupsen/logrus"
 
+	cfg "github.com/dovydas55/vmware-go-kcl/clientlibrary/config"
+	kc "github.com/dovydas55/vmware-go-kcl/clientlibrary/interfaces"
+	"github.com/dovydas55/vmware-go-kcl/clientlibrary/metrics"
+	"github.com/dovydas55/vmware-go-kcl/clientlibrary/utils"
 	"github.com/stretchr/testify/assert"
-	cfg "github.com/vmware/vmware-go-kcl/clientlibrary/config"
-	kc "github.com/vmware/vmware-go-kcl/clientlibrary/interfaces"
-	"github.com/vmware/vmware-go-kcl/clientlibrary/metrics"
-	"github.com/vmware/vmware-go-kcl/clientlibrary/utils"
 )
 
 const (
