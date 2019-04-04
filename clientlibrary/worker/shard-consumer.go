@@ -28,10 +28,11 @@
 package worker
 
 import (
-	log "github.com/sirupsen/logrus"
 	"math"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -179,7 +180,7 @@ func (sc *ShardConsumer) getRecords(shard *shardStatus) error {
 		if err != nil {
 			if awsErr, ok := err.(awserr.Error); ok {
 				if awsErr.Code() == kinesis.ErrCodeProvisionedThroughputExceededException || awsErr.Code() == ErrCodeKMSThrottlingException {
-					log.Errorf("Error getting records from shard %v: %+v", shard.ID, err)
+					log.Warnf("Error getting records from shard %v: %+v", shard.ID, err)
 					retriedErrors++
 					// exponential backoff
 					// https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Programming.Errors.html#Programming.Errors.RetryAndBackoff

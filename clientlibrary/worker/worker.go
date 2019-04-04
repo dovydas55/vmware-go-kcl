@@ -253,7 +253,7 @@ func (w *Worker) eventLoop() {
 			continue
 		}
 
-		log.Infof("Found %d shards", len(w.shardStatus))
+		log.Debugf("Found %d shards", len(w.shardStatus))
 
 		// Count the number of leases hold by this worker excluding the processed shard
 		counter := 0
