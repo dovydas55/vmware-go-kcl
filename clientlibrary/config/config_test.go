@@ -21,6 +21,8 @@ package config
 import (
 	"testing"
 
+	"github.com/dovydas55/vmware-go-kcl/logger"
+
 	"github.com/stretchr/testify/assert"
 )
 
@@ -37,4 +39,8 @@ func TestConfig(t *testing.T) {
 
 	assert.Equal(t, "appName", kclConfig.ApplicationName)
 	assert.Equal(t, 500, kclConfig.FailoverTimeMillis)
+
+	contextLogger := kclConfig.Logger.WithFields(logger.Fields{"key1": "value1"})
+	contextLogger.Debugf("Starting with default logger")
+	contextLogger.Infof("Default logger is awesome")
 }

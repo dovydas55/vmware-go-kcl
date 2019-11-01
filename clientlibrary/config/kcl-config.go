@@ -34,11 +34,13 @@
 package config
 
 import (
+	"log"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
 
 	"github.com/dovydas55/vmware-go-kcl/clientlibrary/utils"
+	"github.com/dovydas55/vmware-go-kcl/logger"
 )
 
 // NewKinesisClientLibConfig to create a default KinesisClientLibConfiguration based on the required fields.
@@ -93,6 +95,7 @@ func NewKinesisClientLibConfigWithCredentials(applicationName, streamName, regio
 		InitialLeaseTableReadCapacity:                    DEFAULT_INITIAL_LEASE_TABLE_READ_CAPACITY,
 		InitialLeaseTableWriteCapacity:                   DEFAULT_INITIAL_LEASE_TABLE_WRITE_CAPACITY,
 		SkipShardSyncAtWorkerInitializationIfLeasesExist: DEFAULT_SKIP_SHARD_SYNC_AT_STARTUP_IF_LEASES_EXIST,
+		Logger: logger.GetDefaultLogger(),
 	}
 }
 
@@ -200,5 +203,13 @@ func (c *KinesisClientLibConfiguration) WithMetricsBufferTimeMillis(metricsBuffe
 func (c *KinesisClientLibConfiguration) WithMetricsMaxQueueSize(metricsMaxQueueSize int) *KinesisClientLibConfiguration {
 	checkIsValuePositive("MetricsMaxQueueSize", metricsMaxQueueSize)
 	c.MetricsMaxQueueSize = metricsMaxQueueSize
+	return c
+}
+
+func (c *KinesisClientLibConfiguration) WithLogger(logger logger.Logger) *KinesisClientLibConfiguration {
+	if logger == nil {
+		log.Panic("Logger cannot be null")
+	}
+	c.Logger = logger
 	return c
 }

@@ -29,50 +29,20 @@ package worker
 
 import (
 	"errors"
-	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
-
-	log "github.com/sirupsen/logrus"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 	"github.com/aws/aws-sdk-go/service/kinesis"
 	"github.com/aws/aws-sdk-go/service/kinesis/kinesisiface"
 
+	chk "github.com/dovydas55/vmware-go-kcl/clientlibrary/checkpoint"
 	"github.com/dovydas55/vmware-go-kcl/clientlibrary/config"
 	kcl "github.com/dovydas55/vmware-go-kcl/clientlibrary/interfaces"
 	"github.com/dovydas55/vmware-go-kcl/clientlibrary/metrics"
+	par "github.com/dovydas55/vmware-go-kcl/clientlibrary/partition"
 )
-
-type shardStatus struct {
-	ID            string
-	ParentShardId string
-	Checkpoint    string
-	AssignedTo    string
-	mux           *sync.Mutex
-	LeaseTimeout  time.Time
-	// Shard Range
-	StartingSequenceNumber string
-	// child shard doesn't have end sequence number
-	EndingSequenceNumber string
-}
-
-func (ss *shardStatus) getLeaseOwner() string {
-	ss.mux.Lock()
-	defer ss.mux.Unlock()
-	return ss.AssignedTo
-}
-
-func (ss *shardStatus) setLeaseOwner(owner string) {
-	ss.mux.Lock()
-	defer ss.mux.Unlock()
-	ss.AssignedTo = owner
-}
 
 /**
  * Worker is the high level class that Kinesis applications use to start processing data. It initializes and oversees
@@ -87,14 +57,13 @@ type Worker struct {
 	processorFactory kcl.IRecordProcessorFactory
 	kclConfig        *config.KinesisClientLibConfiguration
 	kc               kinesisiface.KinesisAPI
-	dynamo           dynamodbiface.DynamoDBAPI
-	checkpointer     Checkpointer
+	checkpointer     chk.Checkpointer
 
 	stop      *chan struct{}
 	waitGroup *sync.WaitGroup
-	sigs      *chan os.Signal
+	done      bool
 
-	shardStatus map[string]*shardStatus
+	shardStatus map[string]*par.ShardStatus
 
 	metricsConfig *metrics.MonitoringConfiguration
 	mService      metrics.MonitoringService
@@ -109,38 +78,8 @@ func NewWorker(factory kcl.IRecordProcessorFactory, kclConfig *config.KinesisCli
 		processorFactory: factory,
 		kclConfig:        kclConfig,
 		metricsConfig:    metricsConfig,
+		done:             false,
 	}
-
-	// create session for Kinesis
-	log.Info("Creating Kinesis session")
-
-	s, err := session.NewSession(&aws.Config{
-		Region:      aws.String(w.regionName),
-		Endpoint:    &kclConfig.KinesisEndpoint,
-		Credentials: kclConfig.KinesisCredentials,
-	})
-
-	if err != nil {
-		// no need to move forward
-		log.Fatalf("Failed in getting Kinesis session for creating Worker: %+v", err)
-	}
-	w.kc = kinesis.New(s)
-
-	log.Info("Creating DynamoDB session")
-
-	s, err = session.NewSession(&aws.Config{
-		Region:      aws.String(w.regionName),
-		Endpoint:    &kclConfig.DynamoDBEndpoint,
-		Credentials: kclConfig.DynamoDBCredentials,
-	})
-
-	if err != nil {
-		// no need to move forward
-		log.Fatalf("Failed in getting DynamoDB session for creating Worker: %+v", err)
-	}
-
-	w.dynamo = dynamodb.New(s)
-	w.checkpointer = NewDynamoCheckpoint(w.dynamo, kclConfig)
 
 	if w.metricsConfig == nil {
 		// "" means noop monitor service. i.e. not emitting any metrics.
@@ -149,21 +88,35 @@ func NewWorker(factory kcl.IRecordProcessorFactory, kclConfig *config.KinesisCli
 	return w
 }
 
+// WithKinesis is used to provide Kinesis service for either custom implementation or unit testing.
+func (w *Worker) WithKinesis(svc kinesisiface.KinesisAPI) *Worker {
+	w.kc = svc
+	return w
+}
+
+// WithCheckpointer is used to provide a custom checkpointer service for non-dynamodb implementation
+// or unit testing.
+func (w *Worker) WithCheckpointer(checker chk.Checkpointer) *Worker {
+	w.checkpointer = checker
+	return w
+}
+
 // Run starts consuming data from the stream, and pass it to the application record processors.
 func (w *Worker) Start() error {
+	log := w.kclConfig.Logger
 	if err := w.initialize(); err != nil {
-		log.Errorf("Failed to start Worker: %+v", err)
+		log.Errorf("Failed to initialize Worker: %+v", err)
 		return err
 	}
 
 	// Start monitoring service
-	log.Info("Starting monitoring service.")
+	log.Infof("Starting monitoring service.")
 	if err := w.mService.Start(); err != nil {
 		log.Errorf("Failed to start monitoring service: %+v", err)
 		return err
 	}
 
-	log.Info("Starting worker event loop.")
+	log.Infof("Starting worker event loop.")
 	// entering event loop
 	go w.eventLoop()
 	return nil
@@ -171,17 +124,24 @@ func (w *Worker) Start() error {
 
 // Shutdown signals worker to shutdown. Worker will try initiating shutdown of all record processors.
 func (w *Worker) Shutdown() {
-	log.Info("Worker shutdown in requested.")
+	log := w.kclConfig.Logger
+	log.Infof("Worker shutdown in requested.")
+
+	if w.done {
+		return
+	}
 
 	close(*w.stop)
+	w.done = true
 	w.waitGroup.Wait()
 
 	w.mService.Shutdown()
-	log.Info("Worker loop is complete. Exiting from worker.")
+	log.Infof("Worker loop is complete. Exiting from worker.")
 }
 
 // Publish to write some data into stream. This function is mainly used for testing purpose.
 func (w *Worker) Publish(streamName, partitionKey string, data []byte) error {
+	log := w.kclConfig.Logger
 	_, err := w.kc.PutRecord(&kinesis.PutRecordInput{
 		Data:         data,
 		StreamName:   aws.String(streamName),
@@ -195,7 +155,36 @@ func (w *Worker) Publish(streamName, partitionKey string, data []byte) error {
 
 // initialize
 func (w *Worker) initialize() error {
-	log.Info("Worker initialization in progress...")
+	log := w.kclConfig.Logger
+	log.Infof("Worker initialization in progress...")
+
+	// Create default Kinesis session
+	if w.kc == nil {
+		// create session for Kinesis
+		log.Infof("Creating Kinesis session")
+
+		s, err := session.NewSession(&aws.Config{
+			Region:      aws.String(w.regionName),
+			Endpoint:    &w.kclConfig.KinesisEndpoint,
+			Credentials: w.kclConfig.KinesisCredentials,
+		})
+
+		if err != nil {
+			// no need to move forward
+			log.Fatalf("Failed in getting Kinesis session for creating Worker: %+v", err)
+		}
+		w.kc = kinesis.New(s)
+	} else {
+		log.Infof("Use custom Kinesis service.")
+	}
+
+	// Create default dynamodb based checkpointer implementation
+	if w.checkpointer == nil {
+		log.Infof("Creating DynamoDB based checkpointer")
+		w.checkpointer = chk.NewDynamoCheckpoint(w.kclConfig)
+	} else {
+		log.Infof("Use custom checkpointer implementation.")
+	}
 
 	err := w.metricsConfig.Init(w.kclConfig.ApplicationName, w.streamName, w.workerID)
 	if err != nil {
@@ -203,31 +192,26 @@ func (w *Worker) initialize() error {
 	}
 	w.mService = w.metricsConfig.GetMonitoringService()
 
-	log.Info("Initializing Checkpointer")
+	log.Infof("Initializing Checkpointer")
 	if err := w.checkpointer.Init(); err != nil {
 		log.Errorf("Failed to start Checkpointer: %+v", err)
 		return err
 	}
 
-	w.shardStatus = make(map[string]*shardStatus)
-
-	sigs := make(chan os.Signal, 1)
-	w.sigs = &sigs
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	w.shardStatus = make(map[string]*par.ShardStatus)
 
 	stopChan := make(chan struct{})
 	w.stop = &stopChan
 
-	wg := sync.WaitGroup{}
-	w.waitGroup = &wg
+	w.waitGroup = &sync.WaitGroup{}
 
-	log.Info("Initialization complete.")
+	log.Infof("Initialization complete.")
 
 	return nil
 }
 
 // newShardConsumer to create a shard consumer instance
-func (w *Worker) newShardConsumer(shard *shardStatus) *ShardConsumer {
+func (w *Worker) newShardConsumer(shard *par.ShardStatus) *ShardConsumer {
 	return &ShardConsumer{
 		streamName:      w.streamName,
 		shard:           shard,
@@ -237,7 +221,6 @@ func (w *Worker) newShardConsumer(shard *shardStatus) *ShardConsumer {
 		kclConfig:       w.kclConfig,
 		consumerID:      w.workerID,
 		stop:            w.stop,
-		waitGroup:       w.waitGroup,
 		mService:        w.mService,
 		state:           WAITING_ON_PARENT_SHARDS,
 	}
@@ -245,6 +228,8 @@ func (w *Worker) newShardConsumer(shard *shardStatus) *ShardConsumer {
 
 // eventLoop
 func (w *Worker) eventLoop() {
+	log := w.kclConfig.Logger
+
 	for {
 		err := w.syncShard()
 		if err != nil {
@@ -258,7 +243,7 @@ func (w *Worker) eventLoop() {
 		// Count the number of leases hold by this worker excluding the processed shard
 		counter := 0
 		for _, shard := range w.shardStatus {
-			if shard.getLeaseOwner() == w.workerID && shard.Checkpoint != SHARD_END {
+			if shard.GetLeaseOwner() == w.workerID && shard.Checkpoint != chk.SHARD_END {
 				counter++
 			}
 		}
@@ -267,14 +252,14 @@ func (w *Worker) eventLoop() {
 		if counter < w.kclConfig.MaxLeasesForWorker {
 			for _, shard := range w.shardStatus {
 				// already owner of the shard
-				if shard.getLeaseOwner() == w.workerID {
+				if shard.GetLeaseOwner() == w.workerID {
 					continue
 				}
 
 				err := w.checkpointer.FetchCheckpoint(shard)
 				if err != nil {
 					// checkpoint may not existed yet is not an error condition.
-					if err != ErrSequenceIDNotFound {
+					if err != chk.ErrSequenceIDNotFound {
 						log.Errorf(" Error: %+v", err)
 						// move on to next shard
 						continue
@@ -282,15 +267,15 @@ func (w *Worker) eventLoop() {
 				}
 
 				// The shard is closed and we have processed all records
-				if shard.Checkpoint == SHARD_END {
+				if shard.Checkpoint == chk.SHARD_END {
 					continue
 				}
 
 				err = w.checkpointer.GetLease(shard, w.workerID)
 				if err != nil {
 					// cannot get lease on the shard
-					if err.Error() != ErrLeaseNotAquired {
-						log.Error(err)
+					if err.Error() != chk.ErrLeaseNotAquired {
+						log.Errorf("Cannot get lease: %+v", err)
 					}
 					continue
 				}
@@ -300,20 +285,21 @@ func (w *Worker) eventLoop() {
 
 				log.Infof("Start Shard Consumer for shard: %v", shard.ID)
 				sc := w.newShardConsumer(shard)
-				go sc.getRecords(shard)
 				w.waitGroup.Add(1)
+				go func() {
+					defer w.waitGroup.Done()
+					if err := sc.getRecords(shard); err != nil {
+						log.Errorf("Error in getRecords: %+v", err)
+					}
+				}()
 				// exit from for loop and not to grab more shard for now.
 				break
 			}
 		}
 
 		select {
-		case sig := <-*w.sigs:
-			log.Infof("Received signal %s. Exiting", sig)
-			w.Shutdown()
-			return
 		case <-*w.stop:
-			log.Info("Shutting down")
+			log.Infof("Shutting down...")
 			return
 		case <-time.After(time.Duration(w.kclConfig.ShardSyncIntervalMillis) * time.Millisecond):
 		}
@@ -323,6 +309,7 @@ func (w *Worker) eventLoop() {
 // List all ACTIVE shard and store them into shardStatus table
 // If shard has been removed, need to exclude it from cached shard status.
 func (w *Worker) getShardIDs(startShardID string, shardInfo map[string]bool) error {
+	log := w.kclConfig.Logger
 	// The default pagination limit is 100.
 	args := &kinesis.DescribeStreamInput{
 		StreamName: aws.String(w.streamName),
@@ -351,10 +338,10 @@ func (w *Worker) getShardIDs(startShardID string, shardInfo map[string]bool) err
 		// found new shard
 		if _, ok := w.shardStatus[*s.ShardId]; !ok {
 			log.Infof("Found new shard with id %s", *s.ShardId)
-			w.shardStatus[*s.ShardId] = &shardStatus{
+			w.shardStatus[*s.ShardId] = &par.ShardStatus{
 				ID:                     *s.ShardId,
 				ParentShardId:          aws.StringValue(s.ParentShardId),
-				mux:                    &sync.Mutex{},
+				Mux:                    &sync.Mutex{},
 				StartingSequenceNumber: aws.StringValue(s.SequenceNumberRange.StartingSequenceNumber),
 				EndingSequenceNumber:   aws.StringValue(s.SequenceNumberRange.EndingSequenceNumber),
 			}
@@ -375,6 +362,7 @@ func (w *Worker) getShardIDs(startShardID string, shardInfo map[string]bool) err
 
 // syncShard to sync the cached shard info with actual shard info from Kinesis
 func (w *Worker) syncShard() error {
+	log := w.kclConfig.Logger
 	shardInfo := make(map[string]bool)
 	err := w.getShardIDs("", shardInfo)
 

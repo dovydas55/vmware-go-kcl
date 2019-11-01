@@ -16,26 +16,27 @@
  * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-package worker
+package test
 
 import (
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/prometheus/common/expfmt"
-	log "github.com/sirupsen/logrus"
-
 	cfg "github.com/dovydas55/vmware-go-kcl/clientlibrary/config"
 	kc "github.com/dovydas55/vmware-go-kcl/clientlibrary/interfaces"
 	"github.com/dovydas55/vmware-go-kcl/clientlibrary/metrics"
 	"github.com/dovydas55/vmware-go-kcl/clientlibrary/utils"
+	wk "github.com/dovydas55/vmware-go-kcl/clientlibrary/worker"
+	"github.com/dovydas55/vmware-go-kcl/logger"
+	"github.com/prometheus/common/expfmt"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -48,7 +49,25 @@ const (
 const specstr = `{"name":"kube-qQyhk","networking":{"containerNetworkCidr":"10.2.0.0/16"},"orgName":"BVT-Org-cLQch","projectName":"project-tDSJd","serviceLevel":"DEVELOPER","size":{"count":1},"version":"1.8.1-4"}`
 const metricsSystem = "cloudwatch"
 
+var shardID string
+
 func TestWorker(t *testing.T) {
+	// At miminal. use standard logrus logger
+	// log := logger.NewLogrusLogger(logrus.StandardLogger())
+	//
+	// In order to have precise control over logging. Use logger with config
+	config := logger.Configuration{
+		EnableConsole:     true,
+		ConsoleLevel:      logger.Debug,
+		ConsoleJSONFormat: false,
+		EnableFile:        true,
+		FileLevel:         logger.Info,
+		FileJSONFormat:    true,
+		Filename:          "log.log",
+	}
+	// Use logrus logger
+	log := logger.NewLogrusLoggerWithConfig(config)
+
 	kclConfig := cfg.NewKinesisClientLibConfig("appName", streamName, regionName, workerID).
 		WithInitialPositionInStream(cfg.LATEST).
 		WithMaxRecords(10).
@@ -56,9 +75,42 @@ func TestWorker(t *testing.T) {
 		WithShardSyncIntervalMillis(5000).
 		WithFailoverTimeMillis(300000).
 		WithMetricsBufferTimeMillis(10000).
-		WithMetricsMaxQueueSize(20)
+		WithMetricsMaxQueueSize(20).
+		WithLogger(log)
 
-	runTest(kclConfig, t)
+	runTest(kclConfig, false, t)
+}
+
+func TestWorkerWithSigInt(t *testing.T) {
+	// At miminal. use standard zap logger
+	//zapLogger, err := zap.NewProduction()
+	//assert.Nil(t, err)
+	//log := logger.NewZapLogger(zapLogger.Sugar())
+	//
+	// In order to have precise control over logging. Use logger with config.
+	config := logger.Configuration{
+		EnableConsole:     true,
+		ConsoleLevel:      logger.Debug,
+		ConsoleJSONFormat: true,
+		EnableFile:        true,
+		FileLevel:         logger.Info,
+		FileJSONFormat:    true,
+		Filename:          "log.log",
+	}
+	// use zap logger
+	log := logger.NewZapLoggerWithConfig(config)
+
+	kclConfig := cfg.NewKinesisClientLibConfig("appName", streamName, regionName, workerID).
+		WithInitialPositionInStream(cfg.LATEST).
+		WithMaxRecords(10).
+		WithMaxLeasesForWorker(1).
+		WithShardSyncIntervalMillis(5000).
+		WithFailoverTimeMillis(300000).
+		WithMetricsBufferTimeMillis(10000).
+		WithMetricsMaxQueueSize(20).
+		WithLogger(log)
+
+	runTest(kclConfig, true, t)
 }
 
 func TestWorkerStatic(t *testing.T) {
@@ -75,7 +127,7 @@ func TestWorkerStatic(t *testing.T) {
 		WithMetricsBufferTimeMillis(10000).
 		WithMetricsMaxQueueSize(20)
 
-	runTest(kclConfig, t)
+	runTest(kclConfig, false, t)
 }
 
 func TestWorkerAssumeRole(t *testing.T) {
@@ -99,33 +151,48 @@ func TestWorkerAssumeRole(t *testing.T) {
 		WithMetricsBufferTimeMillis(10000).
 		WithMetricsMaxQueueSize(20)
 
-	runTest(kclConfig, t)
+	runTest(kclConfig, false, t)
 }
 
-func runTest(kclConfig *cfg.KinesisClientLibConfiguration, t *testing.T) {
-	log.SetOutput(os.Stdout)
-	log.SetLevel(log.DebugLevel)
-
+func runTest(kclConfig *cfg.KinesisClientLibConfiguration, triggersig bool, t *testing.T) {
 	assert.Equal(t, regionName, kclConfig.RegionName)
 	assert.Equal(t, streamName, kclConfig.StreamName)
 
 	// configure cloudwatch as metrics system
 	metricsConfig := getMetricsConfig(kclConfig, metricsSystem)
 
-	worker := NewWorker(recordProcessorFactory(t), kclConfig, metricsConfig)
-	assert.Equal(t, regionName, worker.regionName)
-	assert.Equal(t, streamName, worker.streamName)
+	worker := wk.NewWorker(recordProcessorFactory(t), kclConfig, metricsConfig)
 
 	err := worker.Start()
 	assert.Nil(t, err)
 
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	// Signal processing.
+	go func() {
+		sig := <-sigs
+		t.Logf("Received signal %s. Exiting", sig)
+		worker.Shutdown()
+		// some other processing before exit.
+		//os.Exit(0)
+	}()
+
 	// Put some data into stream.
+	t.Log("Putting data into stream.")
 	for i := 0; i < 100; i++ {
 		// Use random string as partition key to ensure even distribution across shards
 		err := worker.Publish(streamName, utils.RandStringBytesMaskImpr(10), []byte(specstr))
 		if err != nil {
 			t.Errorf("Errorin Publish. %+v", err)
 		}
+	}
+	t.Log("Done putting data into stream.")
+
+	if triggersig {
+		t.Log("Trigger signal SIGINT")
+		p, _ := os.FindProcess(os.Getpid())
+		p.Signal(os.Interrupt)
 	}
 
 	// wait a few seconds before shutdown processing
@@ -147,6 +214,7 @@ func runTest(kclConfig *cfg.KinesisClientLibConfiguration, t *testing.T) {
 
 	}
 
+	t.Log("Calling normal shutdown at the end of application.")
 	worker.Shutdown()
 }
 
@@ -156,6 +224,7 @@ func getMetricsConfig(kclConfig *cfg.KinesisClientLibConfiguration, service stri
 		return &metrics.MonitoringConfiguration{
 			MonitoringService: "cloudwatch",
 			Region:            regionName,
+			Logger:            kclConfig.Logger,
 			CloudWatch: metrics.CloudWatchMonitoringService{
 				Credentials: kclConfig.CloudWatchCredentials,
 				// Those value should come from kclConfig
@@ -169,6 +238,7 @@ func getMetricsConfig(kclConfig *cfg.KinesisClientLibConfiguration, service stri
 		return &metrics.MonitoringConfiguration{
 			MonitoringService: "prometheus",
 			Region:            regionName,
+			Logger:            kclConfig.Logger,
 			Prometheus: metrics.PrometheusMonitoringService{
 				ListenAddress: ":8080",
 			},
@@ -201,6 +271,7 @@ type dumpRecordProcessor struct {
 
 func (dd *dumpRecordProcessor) Initialize(input *kc.InitializationInput) {
 	dd.t.Logf("Processing SharId: %v at checkpoint: %v", input.ShardId, aws.StringValue(input.ExtendedSequenceNumber.SequenceNumber))
+	shardID = input.ShardId
 }
 
 func (dd *dumpRecordProcessor) ProcessRecords(input *kc.ProcessRecordsInput) {
